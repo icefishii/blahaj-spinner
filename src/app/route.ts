@@ -12,6 +12,13 @@ type CachedImage = {
 
 let cached: CachedImage | null = null;
 
+// Cloudflare KV binding (optional). When present, we store a single current
+// image there so all workers return the same image for the TTL window.
+declare const IMAGES_KV: KVNamespace | undefined;
+const KV_KEY = 'current-image';
+const KV_META_KEY = 'current-image:meta';
+const KV_TTL_SECONDS = Math.floor(CACHE_TTL_MS / 1000);
+
 // Minimal Reddit API types used by the scraper. Keep these narrow to avoid
 // importing large type packages and to satisfy the linter.
 type RedditPost = {
@@ -131,6 +138,30 @@ async function fetchRedditImageUrl(): Promise<string> {
 export async function GET() {
   const now = Date.now();
 
+  // Try KV first (global shared cache)
+  if (typeof IMAGES_KV !== 'undefined') {
+    try {
+      const [buf, metaStr] = await Promise.all([
+        IMAGES_KV.get(KV_KEY, 'arrayBuffer'),
+        IMAGES_KV.get(KV_META_KEY),
+      ]);
+      if (buf && metaStr) {
+        const meta = JSON.parse(metaStr);
+        return new Response(buf, {
+          status: 200,
+          headers: {
+            'Content-Type': meta.contentType,
+            'Cache-Control': 'public, s-maxage=600, stale-while-revalidate=60',
+            'X-Cache-Source': 'kv',
+          },
+        });
+      }
+    } catch (e) {
+      console.error('KV read failed', e);
+      // fall through to in-memory fetch
+    }
+  }
+
   // Serve cached if fresh
   if (cached && now - cached.fetchedAt < CACHE_TTL_MS) {
     // Uint8Array is an acceptable BodyInit (BufferSource)
@@ -153,12 +184,24 @@ export async function GET() {
     const contentType = imgRes.headers.get('Content-Type') || guessContentTypeFromUrl(imageUrl) || 'application/octet-stream';
     const arrayBuffer = await imgRes.arrayBuffer();
 
-    // Update cache (store raw ArrayBuffer so it's valid BodyInit)
+    // Update in-memory cache
     cached = {
       fetchedAt: Date.now(),
       data: arrayBuffer,
       contentType,
     };
+
+    // Try writing to KV so other workers will serve the same image
+    if (typeof IMAGES_KV !== 'undefined') {
+      try {
+        await Promise.all([
+          IMAGES_KV.put(KV_KEY, arrayBuffer, { expirationTtl: KV_TTL_SECONDS }),
+          IMAGES_KV.put(KV_META_KEY, JSON.stringify({ contentType, fetchedAt: Date.now() }), { expirationTtl: KV_TTL_SECONDS }),
+        ]);
+      } catch (e) {
+        console.error('KV write failed', e);
+      }
+    }
 
     return new Response(arrayBuffer, {
       status: 200,

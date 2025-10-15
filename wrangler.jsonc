@@ -11,6 +11,12 @@
 		"binding": "ASSETS",
 		"directory": ".open-next/assets"
 	},
+	"kv_namespaces": [
+		{
+			"binding": "IMAGES_KV",
+			"id": "b43ce6a7b5f144f1b31d90815b146d42"
+		}
+	],
 	"observability": {
 		"enabled": true
 	},
