@@ -48,11 +48,51 @@ function getMinUpvotes(): number {
 }
 
 async function fetchRedditImageUrl(): Promise<string> {
-  const res = await fetch(REDDIT_LIST_URL, {
-    headers: { 'User-Agent': 'blahaj-spinner/1.0 (by /u/anonymous)' },
-  });
-  if (!res.ok) throw new Error('Failed to fetch subreddit listing: ' + res.status);
-  const json = (await res.json()) as unknown as RedditListing;
+  // Try a few variants because some hosts (or Cloudflare worker egress IPs)
+  // may be blocked by Reddit. If a 403 occurs, retry with old.reddit.com and
+  // with a browser-like header set (Accept + Referer + common User-Agent).
+  const fetchVariants: { url: string; headers: Record<string, string> }[] = [
+    { url: REDDIT_LIST_URL, headers: { 'User-Agent': 'blahaj-spinner/1.0 (by /u/anonymous)' } },
+    { url: REDDIT_LIST_URL.replace('www.reddit.com', 'old.reddit.com'), headers: { 'User-Agent': 'blahaj-spinner/1.0 (by /u/anonymous)' } },
+    {
+      url: REDDIT_LIST_URL,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'application/json',
+        Referer: 'https://www.reddit.com/',
+      },
+    },
+    {
+      url: REDDIT_LIST_URL.replace('www.reddit.com', 'old.reddit.com'),
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'application/json',
+        Referer: 'https://www.reddit.com/',
+      },
+    },
+  ];
+
+  let lastErr: Error | null = null;
+  let json: RedditListing | null = null;
+
+  for (const c of fetchVariants) {
+    try {
+      const res = await fetch(c.url, { headers: c.headers });
+      if (!res.ok) {
+        // On 403 we try next candidate; record error to give better diagnostics
+        lastErr = new Error('Failed to fetch subreddit listing: ' + res.status);
+        if (res.status === 403) continue;
+        throw lastErr;
+      }
+      json = (await res.json()) as unknown as RedditListing;
+      break;
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      // try next candidate
+    }
+  }
+
+  if (!json) throw lastErr ?? new Error('Failed to fetch subreddit listing');
 
   const posts: RedditChild[] = Array.isArray(json?.data?.children) ? json.data.children! : [];
 
