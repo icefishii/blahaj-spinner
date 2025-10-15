@@ -6,11 +6,25 @@ const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 type CachedImage = {
   fetchedAt: number;
-  data: Uint8Array;
+  data: ArrayBuffer;
   contentType: string;
 };
 
 let cached: CachedImage | null = null;
+
+// Minimal Reddit API types used by the scraper. Keep these narrow to avoid
+// importing large type packages and to satisfy the linter.
+type RedditPost = {
+  url?: string;
+  url_overridden_by_dest?: string;
+  post_hint?: string;
+  preview?: { images?: Array<{ source?: { url?: string } }> };
+  score?: number;
+};
+
+type RedditChild = { data: RedditPost };
+
+type RedditListing = { data?: { children?: RedditChild[] } };
 
 function guessContentTypeFromUrl(url: string): string | null {
   if (/\.(jpe?g)(\?|$)/i.test(url)) return 'image/jpeg';
@@ -38,28 +52,30 @@ async function fetchRedditImageUrl(): Promise<string> {
     headers: { 'User-Agent': 'blahaj-spinner/1.0 (by /u/anonymous)' },
   });
   if (!res.ok) throw new Error('Failed to fetch subreddit listing: ' + res.status);
-  const json: any = await res.json();
+  const json = (await res.json()) as unknown as RedditListing;
 
-  const posts = Array.isArray(json?.data?.children) ? json.data.children : [];
+  const posts: RedditChild[] = Array.isArray(json?.data?.children) ? json.data.children! : [];
 
   const minUpvotes = getMinUpvotes();
 
-  const candidates = posts.map((p: any) => p.data).filter((d: any) => {
-    const url = d.url_overridden_by_dest || d.url;
-    if (!url || typeof url !== 'string') return false;
-    if (/\.(jpe?g|png|gif|webp)(\?|$)/i.test(url)) return true;
-    if (d.post_hint === 'image') return true;
-    if (d.preview?.images?.[0]?.source?.url) return true;
-    return false;
-  });
+  const candidates = posts
+    .map((p) => p.data)
+    .filter((d) => {
+      const url = d.url_overridden_by_dest || d.url;
+      if (!url || typeof url !== 'string') return false;
+      if (/\.(jpe?g|png|gif|webp)(\?|$)/i.test(url)) return true;
+      if (d.post_hint === 'image') return true;
+      if (d.preview?.images?.[0]?.source?.url) return true;
+      return false;
+    });
 
   // Filter by upvotes (score). If none meet the threshold, fall back to all candidates.
-  const byScore = candidates.filter((d: any) => typeof d.score === 'number' && d.score >= minUpvotes);
+  const byScore = candidates.filter((d) => typeof d.score === 'number' && (d.score ?? 0) >= minUpvotes);
 
   const selectedPool = byScore.length > 0 ? byScore : candidates;
 
   const imageUrls: string[] = selectedPool
-    .map((d: any) => {
+    .map((d) => {
       const url = d.url_overridden_by_dest || d.url || d.preview?.images?.[0]?.source?.url;
       return typeof url === 'string' ? url.replace(/&amp;/g, '&') : '';
     })
@@ -77,7 +93,8 @@ export async function GET() {
 
   // Serve cached if fresh
   if (cached && now - cached.fetchedAt < CACHE_TTL_MS) {
-    return new Response(cached.data as any, {
+    // Uint8Array is an acceptable BodyInit (BufferSource)
+    return new Response(cached.data, {
       status: 200,
       headers: {
         'Content-Type': cached.contentType,
@@ -94,17 +111,16 @@ export async function GET() {
     if (!imgRes.ok) throw new Error('Failed to fetch image: ' + imgRes.status);
 
     const contentType = imgRes.headers.get('Content-Type') || guessContentTypeFromUrl(imageUrl) || 'application/octet-stream';
-  const arrayBuffer = await imgRes.arrayBuffer();
-  const data = new Uint8Array(arrayBuffer);
+    const arrayBuffer = await imgRes.arrayBuffer();
 
-    // Update cache
+    // Update cache (store raw ArrayBuffer so it's valid BodyInit)
     cached = {
       fetchedAt: Date.now(),
-      data,
+      data: arrayBuffer,
       contentType,
     };
 
-  return new Response(data as any, {
+    return new Response(arrayBuffer, {
       status: 200,
       headers: {
         'Content-Type': contentType,
@@ -115,7 +131,7 @@ export async function GET() {
     // If we have stale cached image, serve it as fallback
     console.error('Error in / route:', err);
     if (cached) {
-  return new Response(cached.data as any, {
+  return new Response(cached.data, {
         status: 200,
         headers: { 'Content-Type': cached.contentType, 'X-Cache-Status': 'stale' },
       });
