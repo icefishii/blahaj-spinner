@@ -14,7 +14,7 @@ let cached: CachedImage | null = null;
 
 // Cloudflare KV binding (optional). When present, we store a single current
 // image there so all workers return the same image for the TTL window.
-declare const IMAGES_KV: KVNamespace | undefined;
+import { getCloudflareContext } from '@opennextjs/cloudflare';
 const KV_KEY = 'current-image';
 const KV_META_KEY = 'current-image:meta';
 const KV_TTL_SECONDS = Math.floor(CACHE_TTL_MS / 1000);
@@ -139,20 +139,30 @@ export async function GET() {
   const now = Date.now();
 
   // Try KV first (global shared cache)
-  if (typeof IMAGES_KV !== 'undefined') {
+  let kv: KVNamespace | undefined;
+  try {
+    // Access bindings via OpenNext Cloudflare context
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
+    kv = (getCloudflareContext().env as any)?.IMAGES_KV as KVNamespace | undefined;
+  } catch {
+    kv = undefined;
+  }
+  if (kv) {
     try {
       const [buf, metaStr] = await Promise.all([
-        IMAGES_KV.get(KV_KEY, 'arrayBuffer'),
-        IMAGES_KV.get(KV_META_KEY),
+        kv.get(KV_KEY, 'arrayBuffer'),
+        kv.get(KV_META_KEY),
       ]);
       if (buf && metaStr) {
         const meta = JSON.parse(metaStr);
+        console.log('KV hit: returning cached image from KV');
         return new Response(buf, {
           status: 200,
           headers: {
             'Content-Type': meta.contentType,
             'Cache-Control': 'public, s-maxage=600, stale-while-revalidate=60',
             'X-Cache-Source': 'kv',
+            'X-KV-Available': 'true',
           },
         });
       }
@@ -171,6 +181,8 @@ export async function GET() {
         'Content-Type': cached.contentType,
         // Let a CDN cache for 10 minutes and client not cache (so fresh each request to CDN)
         'Cache-Control': 'public, s-maxage=600, stale-while-revalidate=60',
+        'X-Cache-Source': 'memory',
+  'X-KV-Available': kv ? 'true' : 'false',
       },
     });
   }
@@ -192,12 +204,13 @@ export async function GET() {
     };
 
     // Try writing to KV so other workers will serve the same image
-    if (typeof IMAGES_KV !== 'undefined') {
+    if (kv) {
       try {
         await Promise.all([
-          IMAGES_KV.put(KV_KEY, arrayBuffer, { expirationTtl: KV_TTL_SECONDS }),
-          IMAGES_KV.put(KV_META_KEY, JSON.stringify({ contentType, fetchedAt: Date.now() }), { expirationTtl: KV_TTL_SECONDS }),
+          kv.put(KV_KEY, arrayBuffer, { expirationTtl: KV_TTL_SECONDS }),
+          kv.put(KV_META_KEY, JSON.stringify({ contentType, fetchedAt: Date.now() }), { expirationTtl: KV_TTL_SECONDS }),
         ]);
+        console.log('KV write: stored new image and meta');
       } catch (e) {
         console.error('KV write failed', e);
       }
@@ -208,15 +221,22 @@ export async function GET() {
       headers: {
         'Content-Type': contentType,
         'Cache-Control': 'public, s-maxage=600, stale-while-revalidate=60',
+        'X-Cache-Source': 'origin',
+        'X-KV-Available': kv ? 'true' : 'false',
       },
     });
   } catch (err) {
     // If we have stale cached image, serve it as fallback
     console.error('Error in / route:', err);
     if (cached) {
-  return new Response(cached.data, {
+      return new Response(cached.data, {
         status: 200,
-        headers: { 'Content-Type': cached.contentType, 'X-Cache-Status': 'stale' },
+        headers: {
+          'Content-Type': cached.contentType,
+          'X-Cache-Status': 'stale',
+          'X-Cache-Source': 'memory',
+          'X-KV-Available': kv ? 'true' : 'false',
+        },
       });
     }
     return new Response('Could not fetch image', { status: 502 });
